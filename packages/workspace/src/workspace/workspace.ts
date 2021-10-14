@@ -559,6 +559,12 @@ export const loadWorkspace = async (
       validate?: boolean
       stateOnly?: boolean
     }) : Promise<UpdateNaclFilesResult> => {
+    // // !!!
+    // const isXYZ = (change: DetailedChange): boolean => (
+    //   !isAdditionOrModificationChange(change)
+    // )
+    // console.log('before: %s', changes.map(c => c.id.getFullName())) // eslint-disable-line
+    // console.log('filtered: %s', changes.filter(c => !isXYZ(c)).map(c => c.id.getFullName()))
     const { visible: visibleChanges, hidden: hiddenChanges } = await handleHiddenChanges(
       changes,
       state(),
