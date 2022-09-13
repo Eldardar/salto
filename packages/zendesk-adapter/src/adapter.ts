@@ -17,6 +17,9 @@ import _ from 'lodash'
 import {
   FetchResult, AdapterOperations, DeployResult, DeployModifiers, FetchOptions,
   DeployOptions, Change, isInstanceChange, InstanceElement, getChangeData, ElemIdGetter,
+  isInstanceElement,
+  cloneDeepWithoutRefs,
+  ReferenceExpression,
 } from '@salto-io/adapter-api'
 import {
   client as clientUtils,
@@ -27,8 +30,8 @@ import { collections, objects } from '@salto-io/lowerdash'
 import { logger } from '@salto-io/logging'
 import ZendeskClient from './client/client'
 import { FilterCreator, Filter, filtersRunner, FilterResult } from './filter'
-import { API_DEFINITIONS_CONFIG, FETCH_CONFIG, GUIDE_SUPPORTED_TYPES, ZendeskConfig } from './config'
-import { ZENDESK, BRAND_LOGO_TYPE_NAME } from './constants'
+import { API_DEFINITIONS_CONFIG, FETCH_CONFIG, GUIDE_SUPPORTED_TYPES, ZendeskConfig, CLIENT_CONFIG } from './config'
+import { ZENDESK, BRAND_LOGO_TYPE_NAME, BRAND_TYPE_NAME } from './constants'
 import createChangeValidator from './change_validator'
 import { paginate } from './client/pagination'
 import { getChangeGroupIds } from './group_change'
@@ -79,6 +82,7 @@ import removeBrandLogoFieldFilter from './filters/remove_brand_logo_field'
 import { getConfigFromConfigChanges } from './config_change'
 import { dependencyChanger } from './dependency_changers'
 import customFieldOptionsFilter from './filters/add_restriction'
+import { Credentials } from './auth'
 
 
 const log = logger(module)
@@ -163,11 +167,29 @@ export interface ZendeskAdapterParams {
   // callback function to get an existing elemId or create a new one by the ServiceIds values
   getElemIdFunc?: ElemIdGetter
   configInstance?: InstanceElement
+  credentials: Credentials
 }
+
+const markInstanceWithBrand = (
+  instance: InstanceElement,
+  brandInstance: InstanceElement
+): InstanceElement => (
+  new InstanceElement(
+    `${brandInstance.elemID.name}_${instance.elemID.name}`,
+    instance.refType.clone(),
+    {
+      ...cloneDeepWithoutRefs(instance.value),
+      brand_id: new ReferenceExpression(brandInstance.elemID, brandInstance),
+    },
+    instance.path,
+    cloneDeepWithoutRefs(instance.annotations),
+  )
+)
 
 export default class ZendeskAdapter implements AdapterOperations {
   private createFiltersRunner: () => Promise<Required<Filter>>
   private client: ZendeskClient
+  private credentials: Credentials
   private paginator: clientUtils.Paginator
   private userConfig: ZendeskConfig
   private getElemIdFunc?: ElemIdGetter
@@ -180,11 +202,13 @@ export default class ZendeskAdapter implements AdapterOperations {
     getElemIdFunc,
     config,
     configInstance,
+    credentials,
   }: ZendeskAdapterParams) {
     this.userConfig = config
     this.configInstance = configInstance
     this.getElemIdFunc = getElemIdFunc
     this.client = client
+    this.credentials = credentials
     this.paginator = createPaginator({
       client: this.client,
       paginationFuncCreator: paginate,
@@ -212,15 +236,10 @@ export default class ZendeskAdapter implements AdapterOperations {
 
   @logDuration('generating instances and types from service')
   private async getElements(): Promise<ReturnType<typeof getAllElements>> {
-    const supportedTypes = _.merge(
-      {},
-      this.userConfig.apiDefinitions.supportedTypes,
-      this.userConfig[FETCH_CONFIG].enableGuide ? GUIDE_SUPPORTED_TYPES : {},
-    )
-    return getAllElements({
+    const zendeskSupportElements = await getAllElements({
       adapterName: ZENDESK,
       types: this.userConfig.apiDefinitions.types,
-      supportedTypes,
+      supportedTypes: this.userConfig.apiDefinitions.supportedTypes,
       fetchQuery: this.fetchQuery,
       paginator: this.paginator,
       nestedFieldFinder: findDataField,
@@ -228,6 +247,64 @@ export default class ZendeskAdapter implements AdapterOperations {
       typeDefaults: this.userConfig.apiDefinitions.typeDefaults,
       getElemIdFunc: this.getElemIdFunc,
     })
+
+    if (!this.userConfig[FETCH_CONFIG].enableGuide) {
+      return zendeskSupportElements
+    }
+
+    const brandSubdomains = zendeskSupportElements.elements
+      .filter(isInstanceElement)
+      .filter(instance => instance.elemID.typeName === BRAND_TYPE_NAME)
+
+    const zendeskGuideElementsList = await awu(brandSubdomains)
+      .map(brandInstance => this.getAllElementsByBrand(brandInstance))
+      .toArray()
+
+    const zendeskFetchedElements = [zendeskSupportElements, ...zendeskGuideElementsList]
+      .reduce((calledRecords, newRecord) => ({
+        configChanges: _.uniq([...calledRecords.configChanges, ...newRecord.configChanges]),
+        elements: _.uniqBy(
+          [...calledRecords.elements, ...newRecord.elements],
+          e => e.elemID.getFullName(),
+        ),
+      }))
+
+    return zendeskFetchedElements
+  }
+
+  private getAllElementsByBrand = async (
+    brandInstance: InstanceElement
+  ): ReturnType<typeof getAllElements> => {
+    const brandPaginator = createPaginator({
+      client: new ZendeskClient({
+        credentials: {
+          ...this.credentials,
+          subdomain: brandInstance.value.subdomain,
+        },
+        config: this.userConfig[CLIENT_CONFIG],
+      }),
+      paginationFuncCreator: paginate,
+    })
+    const { configChanges, elements } = await getAllElements({
+      adapterName: ZENDESK,
+      types: this.userConfig.apiDefinitions.types,
+      supportedTypes: GUIDE_SUPPORTED_TYPES,
+      fetchQuery: this.fetchQuery,
+      paginator: brandPaginator,
+      nestedFieldFinder: findDataField,
+      computeGetArgs,
+      typeDefaults: this.userConfig.apiDefinitions.typeDefaults,
+      getElemIdFunc: this.getElemIdFunc,
+    })
+    const [instances, objectTypes] = _.partition(elements, isInstanceElement)
+
+    return {
+      configChanges,
+      elements: [
+        ...objectTypes,
+        ...instances.map(instance => markInstanceWithBrand(instance, brandInstance)),
+      ],
+    }
   }
 
   /**
