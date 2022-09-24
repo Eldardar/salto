@@ -13,37 +13,48 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 */
-import { ElemID, InstanceElement, ObjectType, toChange } from '@salto-io/adapter-api'
+import { ElemID, InstanceElement, ObjectType, toChange, ReferenceExpression } from '@salto-io/adapter-api'
 import { ZENDESK } from '../../src/constants'
 import { zendeskGuideElementsDeploymentValidator } from '../../src/change_validators/zendesk_guide_elements_deployment'
 
 describe('zendeskGuideElementsDeploymentValidator', () => {
+  const brandType = new ObjectType({
+    elemID: new ElemID(ZENDESK, 'brand'),
+  })
+  const nonGuideInstance = new InstanceElement(
+    'New brand',
+    brandType,
+    { name: 'bestBrandEver' },
+  )
   const articleType = new ObjectType({
     elemID: new ElemID(ZENDESK, 'article'),
   })
-  const guideInstance = new InstanceElement(
+  const guideInstanceWithBrand = new InstanceElement(
+    'New Article',
+    articleType,
+    { name: 'article', brand_id: new ReferenceExpression(nonGuideInstance.elemID, nonGuideInstance) },
+  )
+  const guideInstanceWithoutBrand = new InstanceElement(
     'New Article',
     articleType,
     { name: 'article' },
   )
-  const groupType = new ObjectType({
-    elemID: new ElemID(ZENDESK, 'group'),
-  })
-  const nonGuideInstance = new InstanceElement(
-    'New Group',
-    groupType,
-    { name: 'bestGroupEver' },
-  )
-  it('should return an error when deploying changes for a Zendesk Guide type instance', async () => {
+  it('should return an error when deploying changes for a Zendesk Guide type instance without a brand_id field', async () => {
     const errors = await zendeskGuideElementsDeploymentValidator(
-      [toChange({ after: guideInstance })],
+      [toChange({ after: guideInstanceWithoutBrand })],
     )
     expect(errors).toEqual([{
-      elemID: guideInstance.elemID,
+      elemID: guideInstanceWithoutBrand.elemID,
       severity: 'Error',
-      message: 'Deployment of Zendesk Guide elements is not supported.',
-      detailedMessage: `Element ${guideInstance.elemID.getFullName()} which related to the brand ${guideInstance.value.brand_id} cannot be deployed.`,
+      message: `Element ${guideInstanceWithoutBrand.elemID.getFullName()} cannot be deployed.`,
+      detailedMessage: `Element ${guideInstanceWithoutBrand.elemID.getFullName()} is a Zendesk Guide element which isn't related to a brand, and therefore cannot be deployed.`,
     }])
+  })
+  it('should not return an error when deploying changes for a Zendesk Guide type instance with a brand_id field', async () => {
+    const errors = await zendeskGuideElementsDeploymentValidator(
+      [toChange({ after: guideInstanceWithBrand })],
+    )
+    expect(errors).toHaveLength(0)
   })
   it('should not return an error when deploying changes for a non-Zendesk Guide type instance', async () => {
     const errors = await zendeskGuideElementsDeploymentValidator(
